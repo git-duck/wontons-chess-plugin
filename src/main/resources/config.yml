@@ -1,0 +1,34 @@
+# ChessPlugin configuration
+#
+# Each chess piece (and the empty squares) is shown as an item in the inventory board.
+# Use any item/material name valid on your server, e.g. DIAMOND_BLOCK, IRON_BLOCK, PAPER.
+# Names are not case-sensitive.
+#
+# Version notes (works on 1.8.8 - latest):
+#  - On 1.13+ use the modern names (OAK_FENCE, GRAY_STAINED_GLASS_PANE, ...).
+#  - On 1.8 - 1.12 you can use legacy names (FENCE, STAINED_GLASS_PANE:7, ...) with an optional
+#    ":data" value. Common modern names (OAK_FENCE, CLOCK, OAK_SIGN, colored wool / glass /
+#    terracotta / carpet, ...) are translated automatically, so the defaults below work everywhere.
+#  - If a name doesn't exist on your server version, the plugin logs a warning and uses the
+#    default item for that slot.
+#
+# After editing, run /chessreload (permission: chess.admin).
+
+pieces:
+  white:
+    pawn: OAK_FENCE
+    rook: IRON_BLOCK
+    knight: SADDLE
+    bishop: BRICK
+    queen: GOLD_BLOCK
+    king: DIAMOND_BLOCK
+  black:
+    pawn: DARK_OAK_FENCE
+    rook: BLACKSTONE
+    knight: LEATHER_HORSE_ARMOR
+    bishop: NETHER_BRICKS
+    queen: CRYING_OBSIDIAN
+    king: OBSIDIAN
+
+# Item shown on empty squares
+empty-square: GRAY_STAINED_GLASS_PANE
