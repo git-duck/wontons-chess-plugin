@@ -3,7 +3,6 @@ package com.wonton.chess;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
-import org.bukkit.NamespacedKey;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabExecutor;
@@ -11,14 +10,18 @@ import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
-import org.bukkit.event.inventory.*;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.inventory.*;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.ItemMeta;
-import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -29,36 +32,187 @@ import java.util.stream.Collectors;
  * - Top chest (rows 0..3, cols 0..7) -> board rows 0..3
  * - Player inventory visible area (main rows + hotbar; first 8 columns) -> board rows 4..7
  *
+ * Compatibility: compiled against the Spigot 1.8.8 API with Java 8 bytecode and written to
+ * avoid APIs that were removed/changed between 1.8.8 and the newest versions (no NamespacedKey,
+ * no PersistentDataContainer, no direct InventoryView calls, no hard-coded modern Material constants).
+ *
  * Safety:
  * - Player inventories are saved before showing board and restored on close/end.
  * - Clicks in board area are cancelled and handled as chess moves.
- *
- * Notes:
- * - Promotion auto-queens.
- * - Castling, en passant, and check/checkmate are supported.
  */
 public class ChessPlugin extends JavaPlugin implements Listener {
 
-    public static NamespacedKey PIECE_KEY;
+    static final String GUI_TITLE = ChatColor.DARK_GREEN + "Chess (8x8)";
+
     private ChallengeManager challengeManager;
     private final Map<UUID, ChessGame> activeGames = new ConcurrentHashMap<>();
 
+    // Configurable items (loaded from config.yml)
+    private final Map<Color, Map<ChessPieceType, ItemSpec>> pieceItems = new EnumMap<>(Color.class);
+    private ItemSpec emptySquare = new ItemSpec(Material.PAPER, (short) 0);
+
     @Override
     public void onEnable() {
-        PIECE_KEY = new NamespacedKey(this, "chess_piece");
+        saveDefaultConfig();
+        loadItemConfig();
         this.challengeManager = new ChallengeManager(this);
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(this.getCommand("chess")).setExecutor(new ChessCommand());
         Objects.requireNonNull(this.getCommand("chessaccept")).setExecutor(new ChessAcceptCommand());
         Objects.requireNonNull(this.getCommand("chessdeny")).setExecutor(new ChessDenyCommand());
-        getLogger().info("ChessPlugin enabled");
+        Objects.requireNonNull(this.getCommand("chessreload")).setExecutor(new ChessReloadCommand());
+        getLogger().info("ChessPlugin enabled (" + (ItemSpec.LEGACY ? "legacy" : "modern") + " material mode)");
     }
 
     @Override
     public void onDisable() {
-        // End games (this closes inventories -> triggers restoration on close)
+        // End games (restores inventories)
         for (ChessGame g : new ArrayList<>(activeGames.values())) {
             g.endGame("Server shutting down");
+        }
+    }
+
+    // Config / items ----------------------------------------------------------
+
+    void loadItemConfig() {
+        reloadConfig();
+        pieceItems.clear();
+        for (Color color : Color.values()) {
+            Map<ChessPieceType, ItemSpec> m = new EnumMap<>(ChessPieceType.class);
+            for (ChessPieceType type : ChessPieceType.values()) {
+                String path = "pieces." + color.name().toLowerCase(Locale.ROOT) + "." + type.name().toLowerCase(Locale.ROOT);
+                m.put(type, loadSpec(path, defaultPiece(color, type)));
+            }
+            pieceItems.put(color, m);
+        }
+        emptySquare = loadSpec("empty-square", "GRAY_STAINED_GLASS_PANE");
+    }
+
+    private ItemSpec loadSpec(String path, String def) {
+        String configured = getConfig().getString(path, def);
+        ItemSpec spec = ItemSpec.parse(configured);
+        if (spec == null) {
+            getLogger().warning("Unknown item '" + configured + "' at '" + path
+                    + "' for this server version; using default '" + def + "'.");
+            spec = ItemSpec.parse(def);
+        }
+        if (spec == null) spec = new ItemSpec(Material.PAPER, (short) 0);
+        return spec;
+    }
+
+    static String defaultPiece(Color color, ChessPieceType type) {
+        boolean w = color == Color.WHITE;
+        switch (type) {
+            case PAWN:   return w ? "OAK_FENCE" : "DARK_OAK_FENCE";
+            case ROOK:   return w ? "IRON_BLOCK" : "BLACKSTONE";
+            case KNIGHT: return w ? "SADDLE" : "LEATHER_HORSE_ARMOR";
+            case BISHOP: return w ? "BRICK" : "NETHER_BRICKS";
+            case QUEEN:  return w ? "GOLD_BLOCK" : "CRYING_OBSIDIAN";
+            case KING:   return w ? "DIAMOND_BLOCK" : "OBSIDIAN";
+            default:     return "PAPER";
+        }
+    }
+
+    ItemStack pieceItem(Color color, ChessPieceType type) {
+        return pieceItems.get(color).get(type).create();
+    }
+
+    ItemStack emptySquareItem() {
+        return emptySquare.create();
+    }
+
+    /** Item for GUI buttons; falls back to PAPER if the material doesn't exist on this version. */
+    static ItemStack buttonItem(String material) {
+        ItemSpec s = ItemSpec.parse(material);
+        if (s == null) s = new ItemSpec(Material.PAPER, (short) 0);
+        return s.create();
+    }
+
+    /** Material + legacy data value, resolved safely across versions. */
+    static final class ItemSpec {
+        /** true on 1.8 - 1.12 (pre "flattening"), where items use numeric data values. */
+        static final boolean LEGACY = detectLegacy();
+        private static final Map<String, String> LEGACY_ALIASES = new HashMap<>();
+
+        static {
+            // modern name -> legacy name[:data]
+            LEGACY_ALIASES.put("OAK_FENCE", "FENCE");
+            LEGACY_ALIASES.put("BRICK", "CLAY_BRICK");   // the brick ITEM
+            LEGACY_ALIASES.put("BRICKS", "BRICK");       // the brick BLOCK
+            LEGACY_ALIASES.put("NETHER_BRICKS", "NETHER_BRICK");
+            LEGACY_ALIASES.put("BLACKSTONE", "COAL_BLOCK");
+            LEGACY_ALIASES.put("LEATHER_HORSE_ARMOR", "IRON_BARDING");
+            LEGACY_ALIASES.put("CRYING_OBSIDIAN", "LAPIS_BLOCK");
+            LEGACY_ALIASES.put("CLOCK", "WATCH");
+            LEGACY_ALIASES.put("OAK_SIGN", "SIGN");
+            String[] colors = {"WHITE", "ORANGE", "MAGENTA", "LIGHT_BLUE", "YELLOW", "LIME", "PINK", "GRAY",
+                    "LIGHT_GRAY", "CYAN", "PURPLE", "BLUE", "BROWN", "GREEN", "RED", "BLACK"};
+            for (int i = 0; i < colors.length; i++) {
+                LEGACY_ALIASES.put(colors[i] + "_STAINED_GLASS_PANE", "STAINED_GLASS_PANE:" + i);
+                LEGACY_ALIASES.put(colors[i] + "_STAINED_GLASS", "STAINED_GLASS:" + i);
+                LEGACY_ALIASES.put(colors[i] + "_WOOL", "WOOL:" + i);
+                LEGACY_ALIASES.put(colors[i] + "_TERRACOTTA", "STAINED_CLAY:" + i);
+                LEGACY_ALIASES.put(colors[i] + "_CARPET", "CARPET:" + i);
+            }
+        }
+
+        final Material material;
+        final short data;
+
+        ItemSpec(Material material, short data) {
+            this.material = material;
+            this.data = data;
+        }
+
+        ItemStack create() {
+            return data == 0 ? new ItemStack(material) : new ItemStack(material, 1, data);
+        }
+
+        private static boolean detectLegacy() {
+            try {
+                String[] parts = Bukkit.getBukkitVersion().split("-")[0].split("\\.");
+                if (parts.length >= 2 && parts[0].equals("1")) {
+                    return Integer.parseInt(parts[1]) < 13;
+                }
+            } catch (RuntimeException ignored) {
+                // unparseable (e.g. new year-based versions like 26.x) -> modern
+            }
+            return false;
+        }
+
+        /** Accepts "NAME" or "NAME:data". Returns null if the material is unknown on this server. */
+        static ItemSpec parse(String raw) {
+            if (raw == null) return null;
+            String s = raw.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+            if (s.isEmpty()) return null;
+            String name = s;
+            short data = 0;
+            boolean explicit = false;
+            int idx = s.indexOf(':');
+            if (idx >= 0) {
+                name = s.substring(0, idx);
+                try {
+                    data = Short.parseShort(s.substring(idx + 1));
+                    explicit = true;
+                } catch (NumberFormatException ex) {
+                    return null;
+                }
+            }
+            if (LEGACY) {
+                String alias = LEGACY_ALIASES.get(name);
+                if (alias != null) {
+                    int a = alias.indexOf(':');
+                    if (a >= 0) {
+                        name = alias.substring(0, a);
+                        if (!explicit) data = Short.parseShort(alias.substring(a + 1));
+                    } else {
+                        name = alias;
+                    }
+                }
+            }
+            Material m = Material.matchMaterial(name);
+            if (m == null || m == Material.AIR) return null;
+            return new ItemSpec(m, LEGACY ? data : (short) 0);
         }
     }
 
@@ -72,8 +226,15 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 return true;
             }
             Player p = (Player) sender;
+            if (args.length == 0) {
+                ChessGame g = activeGames.get(p.getUniqueId());
+                if (g != null) {
+                    g.openFor(p); // reopen the board after closing it
+                    return true;
+                }
+            }
             if (args.length != 1) {
-                p.sendMessage(ChatColor.RED + "Usage: /chess <player>");
+                p.sendMessage(ChatColor.RED + "Usage: /chess <player>  (or /chess to reopen your board)");
                 return true;
             }
             Player target = Bukkit.getPlayerExact(args[0]);
@@ -126,6 +287,10 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 accepter.sendMessage(ChatColor.RED + "Challenger is no longer online.");
                 return true;
             }
+            if (activeGames.containsKey(challengerId) || activeGames.containsKey(accepter.getUniqueId())) {
+                accepter.sendMessage(ChatColor.RED + "Either you or the challenger is already in a game.");
+                return true;
+            }
             ChessGame game = new ChessGame(ChessPlugin.this, challenger, accepter);
             activeGames.put(challenger.getUniqueId(), game);
             activeGames.put(accepter.getUniqueId(), game);
@@ -166,6 +331,24 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private class ChessReloadCommand implements TabExecutor {
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            if (!sender.hasPermission("chess.admin")) {
+                sender.sendMessage(ChatColor.RED + "You don't have permission.");
+                return true;
+            }
+            loadItemConfig();
+            sender.sendMessage(ChatColor.GREEN + "Chess config reloaded. Open boards update on the next tick.");
+            return true;
+        }
+
+        @Override
+        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+            return Collections.emptyList();
+        }
+    }
+
     // Events ------------------------------------------------------------------
 
     @EventHandler
@@ -174,10 +357,19 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         if (!(he instanceof Player)) return;
         Player p = (Player) he;
         ChessGame g = activeGames.get(p.getUniqueId());
-        if (g == null) return;
-        // delegate to game; always cancel so no items are moved in board area
+        // Only intercept clicks while THIS game's board is the open inventory
+        if (g == null || !g.isBoard(p, e.getInventory())) return;
         e.setCancelled(true);
         g.onInventoryClick(p, e);
+    }
+
+    @EventHandler
+    public void onInventoryDrag(InventoryDragEvent e) {
+        HumanEntity he = e.getWhoClicked();
+        if (!(he instanceof Player)) return;
+        Player p = (Player) he;
+        ChessGame g = activeGames.get(p.getUniqueId());
+        if (g != null && g.isBoard(p, e.getInventory())) e.setCancelled(true);
     }
 
     @EventHandler
@@ -187,7 +379,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         Player p = (Player) he;
         ChessGame g = activeGames.get(p.getUniqueId());
         if (g != null) {
-            g.onClose(p);
+            g.onClose(p, e.getInventory());
         }
     }
 
@@ -261,8 +453,13 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         final ChessBoard board;
         UUID selectedPlayer = null;
         int selectedX = -1, selectedY = -1;
-        // track whether player's inventory has been replaced (so we know to restore)
+        // player's original inventory, kept until the board is closed / game ends
         final Map<UUID, SavedInventory> saved = new HashMap<>();
+        // the board inventory each player currently has open (we track it ourselves so we never
+        // need InventoryView, which changed from class to interface in 1.21)
+        final Map<UUID, Inventory> boards = new HashMap<>();
+        // players whose board is being re-opened (ignore the close event this causes)
+        final Set<UUID> switching = new HashSet<>();
         // timers
         int whiteTime = 5 * 60;
         int blackTime = 5 * 60;
@@ -288,6 +485,11 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             updateAllInventories();
         }
 
+        boolean isBoard(Player p, Inventory inv) {
+            Inventory mine = boards.get(p.getUniqueId());
+            return mine != null && mine == inv;
+        }
+
         void tick() {
             if (!running) return;
             if (board.whiteToMove) {
@@ -297,7 +499,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 blackTime--;
                 if (blackTime <= 0) endGame("White wins on time");
             }
-            updateAllInventories();
+            if (running) updateAllInventories();
         }
 
         void endGame(String reason) {
@@ -305,15 +507,17 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             running = false;
             if (timerTask != null) timerTask.cancel();
             sendBoth(ChatColor.YELLOW + "Game ended: " + reason);
-            // close GUIs (will trigger onClose -> restore)
             for (Player p : Arrays.asList(white, black)) {
+                boards.remove(p.getUniqueId()); // so the close event below is ignored
                 if (p.isOnline()) p.closeInventory();
             }
-            // ensure saved inventories restored (in case close events weren't processed)
             for (UUID id : new ArrayList<>(saved.keySet())) {
                 Player p = Bukkit.getPlayer(id);
-                if (p != null && p.isOnline()) saved.get(id).restore(p);
-                saved.remove(id);
+                SavedInventory s = saved.remove(id);
+                if (p != null && p.isOnline() && s != null) {
+                    s.restore(p);
+                    p.updateInventory();
+                }
             }
             plugin.removeGame(this);
         }
@@ -324,12 +528,18 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             endGame(other.getName() + " wins (opponent disconnected)");
         }
 
-        void onClose(Player p) {
+        void onClose(Player p, Inventory closed) {
+            UUID id = p.getUniqueId();
+            if (switching.contains(id)) return;
+            Inventory mine = boards.get(id);
+            if (mine == null || mine != closed) return;
+            boards.remove(id);
             // restore player's inventory when they close the board; game continues
-            SavedInventory s = saved.remove(p.getUniqueId());
+            SavedInventory s = saved.remove(id);
             if (s != null) {
                 s.restore(p);
-                p.sendMessage(ChatColor.GRAY + "Your inventory has been restored. Reopen the board to continue.");
+                p.updateInventory();
+                p.sendMessage(ChatColor.GRAY + "Your inventory has been restored. Type /chess to reopen the board.");
             }
         }
 
@@ -340,78 +550,67 @@ public class ChessPlugin extends JavaPlugin implements Listener {
 
         // Build and open combined view for player
         void openFor(Player p) {
-            if (!p.isOnline()) return;
-            // Save current inventory if we haven't already
-            if (!saved.containsKey(p.getUniqueId())) {
-                saved.put(p.getUniqueId(), SavedInventory.save(p));
+            if (!p.isOnline() || !running) return;
+            UUID id = p.getUniqueId();
+            // Save current inventory only once
+            if (!saved.containsKey(id)) {
+                saved.put(id, SavedInventory.save(p));
             }
-            // Build top inventory (54)
-            Inventory inv = Bukkit.createInventory(null, 54, ChatColor.DARK_GREEN + "Chess (8x8)");
-            // fill top 4 ranks into chest top:
-            // top area: guiRow 0..3, col 0..7 -> boardRow = guiRow, boardCol = col
+            Inventory inv = Bukkit.createInventory(null, 54, GUI_TITLE);
+            fillTop(inv);
+            fillBottom(p);
+            switching.add(id);
+            try {
+                p.openInventory(inv);
+            } finally {
+                switching.remove(id);
+            }
+            boards.put(id, inv);
+            p.updateInventory();
+        }
+
+        /** Top chest: board rows 0..3, info column, and control buttons. */
+        private void fillTop(Inventory inv) {
             for (int guiRow = 0; guiRow < 4; guiRow++) {
                 for (int guiCol = 0; guiCol < 8; guiCol++) {
-                    int slot = guiRow * 9 + guiCol; // col 8 reserved for controls
-                    ChessPiece piece = board.getPiece(guiRow, guiCol);
-                    inv.setItem(slot, toItemFor(piece));
+                    inv.setItem(guiRow * 9 + guiCol, toItemFor(board.getPiece(guiRow, guiCol)));
                 }
-                // control column at col 8
-                int ctrlSlot = guiRow * 9 + 8;
                 String text;
                 if (guiRow == 0) text = ChatColor.AQUA + "White: " + formatTime(whiteTime);
                 else if (guiRow == 1) text = ChatColor.AQUA + "Black: " + formatTime(blackTime);
                 else if (guiRow == 2) text = ChatColor.YELLOW + "Turn: " + (board.whiteToMove ? "White" : "Black");
                 else text = ChatColor.GRAY + "8x8 Board";
-                ItemStack info = new ItemStack(Material.PAPER);
-                ItemMeta meta = info.getItemMeta();
-                meta.setDisplayName(text);
-                info.setItemMeta(meta);
-                inv.setItem(ctrlSlot, info);
+                inv.setItem(guiRow * 9 + 8, createButton("PAPER", text));
             }
-            // bottom chest row: controls
-            inv.setItem(45, createButton(Material.ARROW, ChatColor.GREEN + "Flip"));
-            inv.setItem(46, createButton(Material.BARRIER, ChatColor.RED + "Resign"));
-            inv.setItem(47, createButton(Material.CLOCK, ChatColor.GOLD + "Time"));
-            inv.setItem(51, createButton(Material.PAPER, ChatColor.AQUA + "Info"));
-            inv.setItem(53, createButton(Material.OAK_SIGN, ChatColor.GRAY + "Close"));
+            inv.setItem(45, createButton("ARROW", ChatColor.GREEN + "Flip"));
+            inv.setItem(46, createButton("BARRIER", ChatColor.RED + "Resign"));
+            inv.setItem(47, createButton("CLOCK", ChatColor.GOLD + "Time"));
+            inv.setItem(51, createButton("PAPER", ChatColor.AQUA + "Info"));
+            inv.setItem(53, createButton("OAK_SIGN", ChatColor.GRAY + "Close"));
+        }
 
-            // Apply bottom 4 ranks into player's own visible inventory slots:
-            // bottomRow 0..3 maps to board rows 4..7
-            // PlayerInventory slot mapping:
-            // hotbar: 0..8 (we'll use 0..7)
-            // main rows: 9..17, 18..26, 27..35
+        /**
+         * Bottom half of the board goes into the player's own inventory:
+         * board rows 4..6 -> main rows (slots 9..16, 18..25, 27..34), row 7 -> hotbar (0..7).
+         */
+        private void fillBottom(Player p) {
             PlayerInventory pinv = p.getInventory();
-            // prepare a clean copy of the saved inventory contents as base then overwrite the controlled slots
-            // Clear the 32 slots we will write to, then set them
-            // bottomRow 0 -> main row 1 (slots 9..16)
-            // bottomRow 1 -> main row 2 (slots 18..25)
-            // bottomRow 2 -> main row 3 (slots 27..34)
-            // bottomRow 3 -> hotbar (slots 0..7)
-            // For each bottomRow
             for (int br = 0; br < 4; br++) {
                 int boardRow = 4 + br;
                 for (int col = 0; col < 8; col++) {
-                    ItemStack item = toItemFor(board.getPiece(boardRow, col));
-                    int invIndex;
-                    if (br == 3) { // hotbar
-                        invIndex = col; // 0..7
-                    } else {
-                        invIndex = 9 + br * 9 + col; // br 0 -> 9..16, br1->18..25, br2->27..34 (works since 9 + br*9)
-                        // Note: for br=0 -> 9 + 0 + col = 9..16 ; br=1 -> 18..25 ; br=2 -> 27..34
-                    }
-                    pinv.setItem(invIndex, item);
+                    int invIndex = (br == 3) ? col : 9 + br * 9 + col;
+                    pinv.setItem(invIndex, toItemFor(board.getPiece(boardRow, col)));
                 }
             }
-
-            // Finally open the chest for the player
-            p.openInventory(inv);
         }
 
-        private ItemStack createButton(Material mat, String name) {
-            ItemStack it = new ItemStack(mat);
+        private ItemStack createButton(String material, String name) {
+            ItemStack it = ChessPlugin.buttonItem(material);
             ItemMeta m = it.getItemMeta();
-            m.setDisplayName(name);
-            it.setItemMeta(m);
+            if (m != null) {
+                m.setDisplayName(name);
+                it.setItemMeta(m);
+            }
             return it;
         }
 
@@ -422,96 +621,61 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         }
 
         private ItemStack toItemFor(ChessPiece p) {
-            if (p == null) return new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
-            Material mat = materialFor(p);
-            ItemStack it = new ItemStack(mat);
+            if (p == null) return plugin.emptySquareItem();
+            ItemStack it = plugin.pieceItem(p.color, p.type);
             ItemMeta meta = it.getItemMeta();
-            meta.setDisplayName((p.color == Color.WHITE ? ChatColor.WHITE : ChatColor.DARK_GRAY) + p.type.name());
-            meta.setLore(Collections.singletonList("x" + p.x + " y" + p.y));
-            meta.getPersistentDataContainer().set(ChessPlugin.PIECE_KEY, PersistentDataType.STRING, p.toShortString());
-            it.setItemMeta(meta);
-            return it;
-        }
-
-        private Material materialFor(ChessPiece p) {
-            switch (p.type) {
-                case PAWN: return p.color == Color.WHITE ? Material.OAK_FENCE : Material.DARK_OAK_FENCE;
-                case ROOK: return p.color == Color.WHITE ? Material.IRON_BLOCK : Material.BLACKSTONE;
-                case KNIGHT: return p.color == Color.WHITE ? Material.SADDLE : Material.LEATHER_HORSE_ARMOR;
-                case BISHOP: return p.color == Color.WHITE ? Material.BRICK : Material.NETHER_BRICKS;
-                case QUEEN: return p.color == Color.WHITE ? Material.GOLD_BLOCK : Material.CRYING_OBSIDIAN;
-                case KING: return p.color == Color.WHITE ? Material.DIAMOND_BLOCK : Material.OBSIDIAN;
-                default: return Material.PAPER;
+            if (meta != null) {
+                meta.setDisplayName((p.color == Color.WHITE ? ChatColor.WHITE : ChatColor.DARK_GRAY) + p.type.name());
+                meta.setLore(Collections.singletonList("x" + p.x + " y" + p.y));
+                it.setItemMeta(meta);
             }
+            return it;
         }
 
         // Handle clicks in combined view
         void onInventoryClick(Player p, InventoryClickEvent e) {
             if (!running) return;
-            // Identify rawSlot and whether it's a top chest board square or player inventory board square
             int raw = e.getRawSlot();
-            // First handle chest control buttons (they are in top chest area)
+            if (raw < 0) return;
             if (raw < 54) {
-                int r = raw / 9;
-                int c = raw % 9;
-                // control column at c==8 (info/time)
-                if (c == 8 && r >= 0 && r < 4) {
-                    ItemStack current = e.getCurrentItem();
-                    if (current == null || !current.hasItemMeta()) return;
-                    String name = ChatColor.stripColor(current.getItemMeta().getDisplayName());
-                    // nothing special for these info slots
-                    return;
-                }
                 // bottom control slots row (45..53)
-                if (raw >= 45 && raw <= 53) {
+                if (raw >= 45) {
                     ItemStack cur = e.getCurrentItem();
-                    if (cur == null || !cur.hasItemMeta()) return;
+                    if (cur == null || !cur.hasItemMeta() || !cur.getItemMeta().hasDisplayName()) return;
                     String name = ChatColor.stripColor(cur.getItemMeta().getDisplayName());
                     switch (name) {
                         case "Flip":
-                            // flip view by restoring and reopening (simpler: just reopen)
-                            openFor(p);
+                            openFor(p); // refresh/reopen the board
                             return;
                         case "Resign":
-                            endGame((p.getName()) + " resigned. " + ((p.getUniqueId().equals(white.getUniqueId())) ? black.getName() : white.getName()) + " wins.");
+                            endGame(p.getName() + " resigned. " + (p.getUniqueId().equals(white.getUniqueId()) ? black.getName() : white.getName()) + " wins.");
                             return;
                         case "Time":
                             p.sendMessage(ChatColor.AQUA + "White: " + formatTime(whiteTime) + " | Black: " + formatTime(blackTime));
                             return;
                         case "Info":
-                            p.sendMessage(ChatColor.GRAY + "8x8 combined board. Close to restore inventory.");
+                            p.sendMessage(ChatColor.GRAY + "8x8 combined board. Close to restore inventory; /chess reopens it.");
                             return;
                         case "Close":
                             p.closeInventory();
                             return;
+                        default:
+                            return;
                     }
                 }
-                // chest board region: rows 0..3, cols 0..7
+                // chest board region: rows 0..3, cols 0..7 (col 8 is the info column)
                 int guiRow = raw / 9;
                 int guiCol = raw % 9;
-                if (guiRow >= 0 && guiRow < 4 && guiCol >= 0 && guiCol < 8) {
-                    int boardRow = guiRow;
-                    int boardCol = guiCol;
-                    handleBoardClick(p, boardRow, boardCol);
-                    return;
-                } else {
-                    // clicking non-board chest slot -> ignore (cancelled already)
-                    return;
+                if (guiRow < 4 && guiCol < 8) {
+                    handleBoardClick(p, guiRow, guiCol);
                 }
             } else {
-                // player inventory region: rawSlot >= 54
+                // player inventory region: rawSlot >= 54 (main rows first, then hotbar)
                 int bottomIndex = raw - 54;
                 int brow = bottomIndex / 9;
                 int bcol = bottomIndex % 9;
-                // only accept brow 0..3 and bcol 0..7 as our board area
-                if (brow >= 0 && brow < 4 && bcol >= 0 && bcol < 8) {
-                    int boardRow = 4 + brow;
-                    int boardCol = bcol;
-                    handleBoardClick(p, boardRow, boardCol);
-                    return;
-                } else {
-                    // clicks in the parts of player's inventory outside our mapped area (e.g., last column) are cancelled to avoid item movement issues
-                    return;
+                if (brow >= 0 && brow < 4 && bcol < 8) {
+                    handleBoardClick(p, 4 + brow, bcol);
                 }
             }
         }
@@ -519,9 +683,13 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         private void handleBoardClick(Player player, int br, int bc) {
             if (!running) return;
             ChessPiece clicked = board.getPiece(br, bc);
-            // if no selection started
+            boolean isWhitePlayer = player.getUniqueId().equals(white.getUniqueId());
             if (selectedPlayer == null) {
                 if (clicked == null) return;
+                if ((clicked.color == Color.WHITE) != isWhitePlayer) {
+                    player.sendMessage(ChatColor.RED + "You are playing " + (isWhitePlayer ? "White" : "Black") + ".");
+                    return;
+                }
                 if (clicked.color == Color.WHITE && !board.whiteToMove) {
                     player.sendMessage(ChatColor.RED + "It's not White's turn.");
                     return;
@@ -542,7 +710,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 int toX = br, toY = bc;
                 List<ChessMove> legal = board.legalMoves(fromX, fromY, lastDoublePawn);
                 Optional<ChessMove> chosen = legal.stream().filter(m -> m.toX == toX && m.toY == toY).findFirst();
-                if (chosen.isEmpty()) {
+                if (!chosen.isPresent()) {
                     ChessPiece cc = board.getPiece(br, bc);
                     ChessPiece fromPiece = board.getPiece(fromX, fromY);
                     if (cc != null && fromPiece != null && cc.color == fromPiece.color) {
@@ -555,7 +723,6 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                     return;
                 }
                 ChessMove move = chosen.get();
-                // en passant handling: ChessBoard.applyMove will remove captured pawn if needed
                 if (move.isDoublePawn) lastDoublePawn = new int[]{move.toX, move.toY};
                 else lastDoublePawn = null;
                 board.applyMove(move);
@@ -572,7 +739,6 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 }
                 if (board.isStalemate(board.whiteToMove)) {
                     endGame("Draw by stalemate.");
-                    return;
                 }
             }
         }
@@ -584,56 +750,33 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         }
 
         void updateAllInventories() {
-            // Refresh both players: update chest top and their player-inventory mapped slots
             for (Player p : Arrays.asList(white, black)) {
                 if (!p.isOnline()) continue;
-                InventoryView iv = p.getOpenInventory();
-                if (iv == null) continue;
-                Inventory top = iv.getTopInventory();
-                if (top == null) continue;
-                if (iv.getTitle().equals(ChatColor.DARK_GREEN + "Chess (8x8)")) {
-                    // re-apply top area and player's mapped slots
-                    // top:
-                    for (int guiRow = 0; guiRow < 4; guiRow++) {
-                        for (int guiCol = 0; guiCol < 8; guiCol++) {
-                            int slot = guiRow * 9 + guiCol;
-                            ChessPiece piece = board.getPiece(guiRow, guiCol);
-                            top.setItem(slot, toItemFor(piece));
-                        }
-                        int ctrlSlot = guiRow * 9 + 8;
-                        ItemStack info = top.getItem(ctrlSlot);
-                        if (info != null && info.hasItemMeta()) {
-                            // update time/turn text
-                            ItemMeta meta = info.getItemMeta();
-                            String text;
-                            if (guiRow == 0) text = ChatColor.AQUA + "White: " + formatTime(whiteTime);
-                            else if (guiRow == 1) text = ChatColor.AQUA + "Black: " + formatTime(blackTime);
-                            else if (guiRow == 2) text = ChatColor.YELLOW + "Turn: " + (board.whiteToMove ? "White" : "Black");
-                            else text = ChatColor.GRAY + "8x8 Board";
-                            meta.setDisplayName(text);
-                            info.setItemMeta(meta);
-                            top.setItem(ctrlSlot, info);
-                        }
-                    }
-                    // bottom mapped slots in player's inventory:
-                    PlayerInventory pinv = p.getInventory();
-                    for (int br = 0; br < 4; br++) {
-                        int boardRow = 4 + br;
-                        for (int col = 0; col < 8; col++) {
-                            ItemStack item = toItemFor(board.getPiece(boardRow, col));
-                            int invIndex;
-                            if (br == 3) invIndex = col; // hotbar 0..7
-                            else invIndex = 9 + br * 9 + col; // br 0->9..16, br1->18..25, br2->27..34
-                            pinv.setItem(invIndex, item);
-                        }
-                    }
-                }
+                Inventory top = boards.get(p.getUniqueId());
+                if (top == null) continue; // board not open for this player
+                fillTop(top);
+                fillBottom(p);
+                p.updateInventory();
             }
         }
     }
 
     // Inventory snapshot to restore later
     static class SavedInventory {
+        private static Method GET_OFFHAND;
+        private static Method SET_OFFHAND;
+
+        static {
+            // off-hand only exists on 1.9+, so look it up reflectively
+            try {
+                GET_OFFHAND = PlayerInventory.class.getMethod("getItemInOffHand");
+                SET_OFFHAND = PlayerInventory.class.getMethod("setItemInOffHand", ItemStack.class);
+            } catch (Exception ignored) {
+                GET_OFFHAND = null;
+                SET_OFFHAND = null;
+            }
+        }
+
         final ItemStack[] contents;
         final ItemStack[] armor;
         final ItemStack offhand;
@@ -644,23 +787,37 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             this.offhand = offhand;
         }
 
+        private static ItemStack[] cloneAll(ItemStack[] items) {
+            ItemStack[] out = new ItemStack[items.length];
+            for (int i = 0; i < items.length; i++) out[i] = items[i] == null ? null : items[i].clone();
+            return out;
+        }
+
         static SavedInventory save(Player p) {
             PlayerInventory inv = p.getInventory();
-            ItemStack[] contentsCopy = Arrays.stream(inv.getContents())
-                    .map(item -> item == null ? null : item.clone())
-                    .toArray(ItemStack[]::new);
-            ItemStack[] armorCopy = Arrays.stream(inv.getArmorContents())
-                    .map(item -> item == null ? null : item.clone())
-                    .toArray(ItemStack[]::new);
-            ItemStack off = inv.getItemInOffHand() == null ? null : inv.getItemInOffHand().clone();
-            return new SavedInventory(contentsCopy, armorCopy, off);
+            ItemStack off = null;
+            if (GET_OFFHAND != null) {
+                try {
+                    ItemStack o = (ItemStack) GET_OFFHAND.invoke(inv);
+                    off = o == null ? null : o.clone();
+                } catch (Exception ignored) {
+                    // leave null
+                }
+            }
+            return new SavedInventory(cloneAll(inv.getContents()), cloneAll(inv.getArmorContents()), off);
         }
 
         void restore(Player p) {
             PlayerInventory inv = p.getInventory();
-            inv.setContents(Arrays.stream(contents).map(item -> item == null ? null : item.clone()).toArray(ItemStack[]::new));
-            inv.setArmorContents(Arrays.stream(armor).map(item -> item == null ? null : item.clone()).toArray(ItemStack[]::new));
-            inv.setItemInOffHand(offhand == null ? null : offhand.clone());
+            inv.setContents(cloneAll(contents));
+            inv.setArmorContents(cloneAll(armor));
+            if (SET_OFFHAND != null) {
+                try {
+                    SET_OFFHAND.invoke(inv, offhand == null ? null : offhand.clone());
+                } catch (Exception ignored) {
+                    // ignore
+                }
+            }
         }
     }
 
