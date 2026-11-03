@@ -1,10 +1,12 @@
 name: ChessPlugin
 main: com.wonton.chess.ChessPlugin
 version: 1.0.0
-api-version: 1.20
+# 1.13 is the lowest api-version Bukkit accepts. Servers older than 1.13 (1.8.8+) ignore this line.
+api-version: '1.13'
+description: 8x8 chess played in the inventory GUI
 commands:
   chess:
-    description: Send a chess challenge: /chess <player>
+    description: "Challenge a player (/chess <player>) or reopen your board (/chess)"
     usage: /chess <player>
     permission: chess.use
   chessaccept:
@@ -15,7 +17,14 @@ commands:
     description: Deny a chess challenge
     usage: /chessdeny
     permission: chess.use
+  chessreload:
+    description: Reload the chess config
+    usage: /chessreload
+    permission: chess.admin
 permissions:
   chess.use:
     description: Allows using the chess commands
     default: true
+  chess.admin:
+    description: Allows reloading the chess config
+    default: op
