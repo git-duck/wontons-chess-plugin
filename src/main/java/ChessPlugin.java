@@ -15,6 +15,7 @@ import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -446,7 +447,28 @@ public class ChessPlugin extends JavaPlugin implements Listener {
 
     // Chess game (engine + combined inventory GUI) ----------------------------
 
+    /**
+     * Marks an inventory as one of our chess boards. Bukkit hands event listeners a different wrapper
+     * object than the one we created, so identity checks on the Inventory fail; the holder survives.
+     */
+    static final class BoardHolder implements InventoryHolder {
+        final ChessGame game;
+        private Inventory inventory;
+        BoardHolder(ChessGame game) { this.game = game; }
+        void setInventory(Inventory inventory) { this.inventory = inventory; }
+        @Override
+        public Inventory getInventory() { return inventory; }
+    }
+
     static class ChessGame {
+        // Side column (chest column 8) button slots
+        static final int SLOT_WHITE_CLOCK = 8;
+        static final int SLOT_BLACK_CLOCK = 17;
+        static final int SLOT_FLIP = 26;
+        static final int SLOT_RESIGN = 35;
+        static final int SLOT_TIME = 44;
+        static final int SLOT_CLOSE = 53;
+
         final ChessPlugin plugin;
         final Player white;
         final Player black;
@@ -455,11 +477,12 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         int selectedX = -1, selectedY = -1;
         // player's original inventory, kept until the board is closed / game ends
         final Map<UUID, SavedInventory> saved = new HashMap<>();
-        // the board inventory each player currently has open (we track it ourselves so we never
-        // need InventoryView, which changed from class to interface in 1.21)
+        // the board inventory each player currently has open
         final Map<UUID, Inventory> boards = new HashMap<>();
         // players whose board is being re-opened (ignore the close event this causes)
         final Set<UUID> switching = new HashSet<>();
+        // players viewing the board from Black's side (White at the top)
+        final Set<UUID> flipped = new HashSet<>();
         // timers
         int whiteTime = 5 * 60;
         int blackTime = 5 * 60;
@@ -478,6 +501,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         void start() {
             board.resetInitialPosition();
             running = true;
+            flipped.add(black.getUniqueId()); // each player starts with their own pieces at the bottom
             openFor(white);
             openFor(black);
             timerTask = plugin.getServer().getScheduler().runTaskTimer(plugin, this::tick, 20L, 20L);
@@ -485,10 +509,16 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             updateAllInventories();
         }
 
+        /** True if this inventory is THIS game's board, currently open for that player. */
         boolean isBoard(Player p, Inventory inv) {
-            Inventory mine = boards.get(p.getUniqueId());
-            return mine != null && mine == inv;
+            if (inv == null || !boards.containsKey(p.getUniqueId())) return false;
+            InventoryHolder h = inv.getHolder();
+            return h instanceof BoardHolder && ((BoardHolder) h).game == this;
         }
+
+        // Display <-> board coordinate mapping. Unflipped: White at the bottom. Flipped: Black at the bottom.
+        private int boardRow(UUID viewer, int displayRow) { return flipped.contains(viewer) ? displayRow : 7 - displayRow; }
+        private int boardCol(UUID viewer, int displayCol) { return flipped.contains(viewer) ? 7 - displayCol : displayCol; }
 
         void tick() {
             if (!running) return;
@@ -531,8 +561,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         void onClose(Player p, Inventory closed) {
             UUID id = p.getUniqueId();
             if (switching.contains(id)) return;
-            Inventory mine = boards.get(id);
-            if (mine == null || mine != closed) return;
+            if (!isBoard(p, closed)) return;
             boards.remove(id);
             // restore player's inventory when they close the board; game continues
             SavedInventory s = saved.remove(id);
@@ -556,8 +585,10 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             if (!saved.containsKey(id)) {
                 saved.put(id, SavedInventory.save(p));
             }
-            Inventory inv = Bukkit.createInventory(null, 54, GUI_TITLE);
-            fillTop(inv);
+            BoardHolder holder = new BoardHolder(this);
+            Inventory inv = Bukkit.createInventory(holder, 54, GUI_TITLE);
+            holder.setInventory(inv);
+            fillTop(inv, id);
             fillBottom(p);
             switching.add(id);
             try {
@@ -569,55 +600,59 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             p.updateInventory();
         }
 
-        /** Top chest: board rows 0..3, info column, and control buttons. */
-        private void fillTop(Inventory inv) {
-            for (int guiRow = 0; guiRow < 4; guiRow++) {
-                for (int guiCol = 0; guiCol < 8; guiCol++) {
-                    inv.setItem(guiRow * 9 + guiCol, toItemFor(board.getPiece(guiRow, guiCol)));
+        /** Top chest: display rows 0..3 of the board, plus the button column on the right. */
+        private void fillTop(Inventory inv, UUID viewer) {
+            for (int dr = 0; dr < 4; dr++) {
+                for (int dc = 0; dc < 8; dc++) {
+                    inv.setItem(dr * 9 + dc, toItemFor(board.getPiece(boardRow(viewer, dr), boardCol(viewer, dc))));
                 }
-                String text;
-                if (guiRow == 0) text = ChatColor.AQUA + "White: " + formatTime(whiteTime);
-                else if (guiRow == 1) text = ChatColor.AQUA + "Black: " + formatTime(blackTime);
-                else if (guiRow == 2) text = ChatColor.YELLOW + "Turn: " + (board.whiteToMove ? "White" : "Black");
-                else text = ChatColor.GRAY + "8x8 Board";
-                inv.setItem(guiRow * 9 + 8, createButton("PAPER", text));
             }
-            inv.setItem(45, createButton("ARROW", ChatColor.GREEN + "Flip"));
-            inv.setItem(46, createButton("BARRIER", ChatColor.RED + "Resign"));
-            inv.setItem(47, createButton("CLOCK", ChatColor.GOLD + "Time"));
-            inv.setItem(51, createButton("PAPER", ChatColor.AQUA + "Info"));
-            inv.setItem(53, createButton("OAK_SIGN", ChatColor.GRAY + "Close"));
+            inv.setItem(SLOT_WHITE_CLOCK, clockItem(true));
+            inv.setItem(SLOT_BLACK_CLOCK, clockItem(false));
+            inv.setItem(SLOT_FLIP, createButton("ARROW", ChatColor.GREEN + "Flip", "Turn the board around"));
+            inv.setItem(SLOT_RESIGN, createButton("BARRIER", ChatColor.RED + "Resign", "Give up the game"));
+            inv.setItem(SLOT_TIME, createButton("CLOCK", ChatColor.GOLD + "Time",
+                    "White: " + formatTime(whiteTime), "Black: " + formatTime(blackTime), "Click to post in chat"));
+            inv.setItem(SLOT_CLOSE, createButton("OAK_SIGN", ChatColor.GRAY + "Close", "Hide the board (/chess reopens it)"));
         }
 
         /**
-         * Bottom half of the board goes into the player's own inventory:
-         * board rows 4..6 -> main rows (slots 9..16, 18..25, 27..34), row 7 -> hotbar (0..7).
+         * Display rows 4..7 go into the player's own inventory:
+         * rows 4..6 -> main rows (slots 9..16, 18..25, 27..34), row 7 -> hotbar (0..7).
          */
         private void fillBottom(Player p) {
+            UUID viewer = p.getUniqueId();
             PlayerInventory pinv = p.getInventory();
             for (int br = 0; br < 4; br++) {
-                int boardRow = 4 + br;
-                for (int col = 0; col < 8; col++) {
-                    int invIndex = (br == 3) ? col : 9 + br * 9 + col;
-                    pinv.setItem(invIndex, toItemFor(board.getPiece(boardRow, col)));
+                int dr = 4 + br;
+                for (int dc = 0; dc < 8; dc++) {
+                    int invIndex = (br == 3) ? dc : 9 + br * 9 + dc;
+                    pinv.setItem(invIndex, toItemFor(board.getPiece(boardRow(viewer, dr), boardCol(viewer, dc))));
                 }
             }
         }
 
-        private ItemStack createButton(String material, String name) {
+        private ItemStack clockItem(boolean whiteSide) {
+            boolean active = running && board.whiteToMove == whiteSide;
+            String name = (active ? ChatColor.GREEN + "> " : ChatColor.AQUA.toString())
+                    + (whiteSide ? "White: " : "Black: ") + formatTime(whiteSide ? whiteTime : blackTime);
+            return createButton(whiteSide ? "WHITE_WOOL" : "BLACK_WOOL", name, active ? "Their turn" : "Waiting");
+        }
+
+        private ItemStack createButton(String material, String name, String... lore) {
             ItemStack it = ChessPlugin.buttonItem(material);
             ItemMeta m = it.getItemMeta();
             if (m != null) {
                 m.setDisplayName(name);
+                if (lore.length > 0) m.setLore(Arrays.asList(lore));
                 it.setItemMeta(m);
             }
             return it;
         }
 
         private String formatTime(int secs) {
-            int m = secs / 60;
-            int s = secs % 60;
-            return String.format("%d:%02d", m, s);
+            if (secs < 0) secs = 0;
+            return String.format("%d:%02d", secs / 60, secs % 60);
         }
 
         private ItemStack toItemFor(ChessPiece p) {
@@ -625,8 +660,10 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             ItemStack it = plugin.pieceItem(p.color, p.type);
             ItemMeta meta = it.getItemMeta();
             if (meta != null) {
-                meta.setDisplayName((p.color == Color.WHITE ? ChatColor.WHITE : ChatColor.DARK_GRAY) + p.type.name());
-                meta.setLore(Collections.singletonList("x" + p.x + " y" + p.y));
+                boolean sel = selectedPlayer != null && p.x == selectedX && p.y == selectedY;
+                String name = (p.color == Color.WHITE ? ChatColor.WHITE : ChatColor.DARK_GRAY) + p.type.name();
+                meta.setDisplayName(sel ? ChatColor.GREEN + "Selected: " + name : name);
+                meta.setLore(Collections.singletonList(squareName(p.x, p.y)));
                 it.setItemMeta(meta);
             }
             return it;
@@ -637,37 +674,14 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             if (!running) return;
             int raw = e.getRawSlot();
             if (raw < 0) return;
+            UUID id = p.getUniqueId();
             if (raw < 54) {
-                // bottom control slots row (45..53)
-                if (raw >= 45) {
-                    ItemStack cur = e.getCurrentItem();
-                    if (cur == null || !cur.hasItemMeta() || !cur.getItemMeta().hasDisplayName()) return;
-                    String name = ChatColor.stripColor(cur.getItemMeta().getDisplayName());
-                    switch (name) {
-                        case "Flip":
-                            openFor(p); // refresh/reopen the board
-                            return;
-                        case "Resign":
-                            endGame(p.getName() + " resigned. " + (p.getUniqueId().equals(white.getUniqueId()) ? black.getName() : white.getName()) + " wins.");
-                            return;
-                        case "Time":
-                            p.sendMessage(ChatColor.AQUA + "White: " + formatTime(whiteTime) + " | Black: " + formatTime(blackTime));
-                            return;
-                        case "Info":
-                            p.sendMessage(ChatColor.GRAY + "8x8 combined board. Close to restore inventory; /chess reopens it.");
-                            return;
-                        case "Close":
-                            p.closeInventory();
-                            return;
-                        default:
-                            return;
-                    }
-                }
-                // chest board region: rows 0..3, cols 0..7 (col 8 is the info column)
-                int guiRow = raw / 9;
-                int guiCol = raw % 9;
-                if (guiRow < 4 && guiCol < 8) {
-                    handleBoardClick(p, guiRow, guiCol);
+                int r = raw / 9;
+                int c = raw % 9;
+                if (c == 8) {
+                    handleButton(p, raw);
+                } else if (r < 4) {
+                    handleBoardClick(p, boardRow(id, r), boardCol(id, c));
                 }
             } else {
                 // player inventory region: rawSlot >= 54 (main rows first, then hotbar)
@@ -675,8 +689,31 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 int brow = bottomIndex / 9;
                 int bcol = bottomIndex % 9;
                 if (brow >= 0 && brow < 4 && bcol < 8) {
-                    handleBoardClick(p, 4 + brow, bcol);
+                    handleBoardClick(p, boardRow(id, 4 + brow), boardCol(id, bcol));
                 }
+            }
+        }
+
+        private void handleButton(Player p, int slot) {
+            switch (slot) {
+                case SLOT_FLIP:
+                    UUID id = p.getUniqueId();
+                    if (!flipped.remove(id)) flipped.add(id);
+                    refresh(p);
+                    break;
+                case SLOT_RESIGN:
+                    endGame(p.getName() + " resigned. " + (p.getUniqueId().equals(white.getUniqueId()) ? black.getName() : white.getName()) + " wins.");
+                    break;
+                case SLOT_WHITE_CLOCK:
+                case SLOT_BLACK_CLOCK:
+                case SLOT_TIME:
+                    p.sendMessage(ChatColor.AQUA + "White: " + formatTime(whiteTime) + " | Black: " + formatTime(blackTime));
+                    break;
+                case SLOT_CLOSE:
+                    p.closeInventory();
+                    break;
+                default:
+                    break;
             }
         }
 
@@ -701,6 +738,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 selectedPlayer = player.getUniqueId();
                 selectedX = br; selectedY = bc;
                 player.sendMessage(ChatColor.YELLOW + "Selected " + clicked.type.name() + " at " + squareName(br, bc));
+                refresh(player);
             } else {
                 if (!selectedPlayer.equals(player.getUniqueId())) {
                     player.sendMessage(ChatColor.RED + "Another player is mid-selection.");
@@ -716,10 +754,12 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                     if (cc != null && fromPiece != null && cc.color == fromPiece.color) {
                         selectedX = br; selectedY = bc;
                         player.sendMessage(ChatColor.YELLOW + "Reselected " + cc.type.name() + " at " + squareName(br, bc));
+                        refresh(player);
                         return;
                     }
                     player.sendMessage(ChatColor.RED + "Illegal move.");
                     selectedPlayer = null; selectedX = -1; selectedY = -1;
+                    refresh(player);
                     return;
                 }
                 ChessMove move = chosen.get();
@@ -743,21 +783,24 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             }
         }
 
+        /** Board row 0 is White's back rank (rank 1); column 0 is the a-file. */
         private String squareName(int r, int c) {
-            char file = (char) ('a' + c);
-            int rank = 8 - r;
-            return "" + file + rank;
+            return "" + (char) ('a' + c) + (r + 1);
+        }
+
+        /** Redraw one player's board (top chest + their own inventory half). */
+        void refresh(Player p) {
+            if (!p.isOnline()) return;
+            Inventory top = boards.get(p.getUniqueId());
+            if (top == null) return; // board not open for this player
+            fillTop(top, p.getUniqueId());
+            fillBottom(p);
+            p.updateInventory();
         }
 
         void updateAllInventories() {
-            for (Player p : Arrays.asList(white, black)) {
-                if (!p.isOnline()) continue;
-                Inventory top = boards.get(p.getUniqueId());
-                if (top == null) continue; // board not open for this player
-                fillTop(top);
-                fillBottom(p);
-                p.updateInventory();
-            }
+            refresh(white);
+            refresh(black);
         }
     }
 
