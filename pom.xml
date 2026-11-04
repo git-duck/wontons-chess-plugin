@@ -10,27 +10,34 @@
   <packaging>jar</packaging>
 
   <name>ChessPlugin</name>
-  <description>Paper plugin: 8x8 chess GUI</description>
+  <description>Spigot/Paper plugin: 8x8 chess GUI (1.8.8 - latest)</description>
 
   <properties>
     <maven.compiler.release>8</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <paper.api.version>1.21-R0.1-SNAPSHOT</paper.api.version>
+    <spigot.api.version>1.8.8-R0.1-SNAPSHOT</spigot.api.version>
   </properties>
 
   <repositories>
     <repository>
-      <id>papermc-repo</id>
-      <url>https://repo.papermc.io/repository/maven-public/</url>
+      <id>spigot-repo</id>
+      <url>https://hub.spigotmc.org/nexus/content/repositories/snapshots/</url>
     </repository>
   </repositories>
 
   <dependencies>
     <dependency>
-      <groupId>io.papermc.paper</groupId>
-      <artifactId>paper-api</artifactId>
-      <version>${paper.api.version}</version>
+      <groupId>org.spigotmc</groupId>
+      <artifactId>spigot-api</artifactId>
+      <version>${spigot.api.version}</version>
       <scope>provided</scope>
+      <exclusions>
+        <!-- Not used by this plugin; its old snapshot repo is gone, so skip resolving it -->
+        <exclusion>
+          <groupId>net.md-5</groupId>
+          <artifactId>bungeecord-chat</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
   </dependencies>
 
