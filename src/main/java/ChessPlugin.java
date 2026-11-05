@@ -69,7 +69,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
     public void onDisable() {
         // End games (restores inventories)
         for (ChessGame g : new ArrayList<>(activeGames.values())) {
-            g.endGame("Server shutting down");
+            g.shutdown();
         }
     }
 
@@ -248,7 +248,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 return true;
             }
             if (activeGames.containsKey(p.getUniqueId()) || activeGames.containsKey(target.getUniqueId())) {
-                p.sendMessage(ChatColor.RED + "Either you or the target is already in a game.");
+                p.sendMessage(ChatColor.RED + "Either you or the target is already in a game (close any open chess board first).");
                 return true;
             }
             challengeManager.createChallenge(p, target);
@@ -393,9 +393,8 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    void removeGame(ChessGame g) {
-        activeGames.remove(g.white.getUniqueId());
-        activeGames.remove(g.black.getUniqueId());
+    void releasePlayer(UUID id, ChessGame g) {
+        activeGames.remove(id, g);
     }
 
     // Challenge manager -------------------------------------------------------
@@ -471,6 +470,10 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         // The chest has 6 rows but the board only needs 4. Start it 2 rows down so the top half
         // sits directly above the player's inventory half, with no gap between the two.
         static final int BOARD_ROW_OFFSET = 2;
+        // Promotion chooser: chest row 0, columns 2..5 (the empty rows above the board)
+        static final int SLOT_PROMO_FIRST = 2;
+        static final ChessPieceType[] PROMO_TYPES = {
+                ChessPieceType.QUEEN, ChessPieceType.ROOK, ChessPieceType.BISHOP, ChessPieceType.KNIGHT};
 
         final ChessPlugin plugin;
         final Player white;
@@ -491,6 +494,10 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         int blackTime = 5 * 60;
         BukkitTask timerTask;
         boolean running = false;
+        String result = "";
+        // a pawn has reached the last rank and its owner has to pick the new piece
+        ChessMove pendingMove = null;
+        UUID pendingPlayer = null;
         // en passant: last double pawn end coordinate or null
         int[] lastDoublePawn = null;
 
@@ -538,27 +545,54 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         void endGame(String reason) {
             if (!running) return;
             running = false;
+            result = reason;
+            pendingMove = null;
+            pendingPlayer = null;
+            selectedPlayer = null; selectedX = -1; selectedY = -1;
             if (timerTask != null) timerTask.cancel();
             sendBoth(ChatColor.YELLOW + "Game ended: " + reason);
             for (Player p : Arrays.asList(white, black)) {
-                boards.remove(p.getUniqueId()); // so the close event below is ignored
-                if (p.isOnline()) p.closeInventory();
+                UUID id = p.getUniqueId();
+                if (p.isOnline() && boards.containsKey(id)) {
+                    // keep the board open so the final position can be looked over
+                    p.sendMessage(ChatColor.GRAY + "The board stays open so you can look over the final position. Click Close when you're done.");
+                    refresh(p);
+                } else {
+                    release(id);
+                }
             }
-            for (UUID id : new ArrayList<>(saved.keySet())) {
-                Player p = Bukkit.getPlayer(id);
-                SavedInventory s = saved.remove(id);
-                if (p != null && p.isOnline() && s != null) {
+        }
+
+        /** Hide the board for a player (if open), give their inventory back and drop them from this game. */
+        private void release(UUID id) {
+            boolean wasOpen = boards.remove(id) != null; // removed first so the close event is ignored
+            SavedInventory s = saved.remove(id);
+            Player p = Bukkit.getPlayer(id);
+            if (p != null && p.isOnline()) {
+                if (wasOpen) p.closeInventory();
+                if (s != null) {
                     s.restore(p);
                     p.updateInventory();
                 }
             }
-            plugin.removeGame(this);
+            plugin.releasePlayer(id, this);
+        }
+
+        /** Server shutdown: close every board and hand inventories back. */
+        void shutdown() {
+            running = false;
+            if (timerTask != null) timerTask.cancel();
+            release(white.getUniqueId());
+            release(black.getUniqueId());
         }
 
         void onPlayerQuit(Player p) {
-            if (!running) return;
-            Player other = (p.getUniqueId().equals(white.getUniqueId())) ? black : white;
-            endGame(other.getName() + " wins (opponent disconnected)");
+            UUID id = p.getUniqueId();
+            release(id); // the leaving player gets their inventory back right away
+            if (running) {
+                Player other = id.equals(white.getUniqueId()) ? black : white;
+                endGame(other.getName() + " wins (opponent disconnected)");
+            }
         }
 
         void onClose(Player p, Inventory closed) {
@@ -566,12 +600,16 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             if (switching.contains(id)) return;
             if (!isBoard(p, closed)) return;
             boards.remove(id);
-            // restore player's inventory when they close the board; game continues
+            // restore the player's inventory when they close the board
             SavedInventory s = saved.remove(id);
             if (s != null) {
                 s.restore(p);
                 p.updateInventory();
+            }
+            if (running) {
                 p.sendMessage(ChatColor.GRAY + "Your inventory has been restored. Type /chess to reopen the board.");
+            } else {
+                plugin.releasePlayer(id, this); // finished game: nothing left to reopen
             }
         }
 
@@ -605,6 +643,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
 
         /** Top chest: display rows 0..3 of the board (chest rows 2..5), plus the button column on the right. */
         private void fillTop(Inventory inv, UUID viewer) {
+            fillPromotion(inv, viewer);
             for (int dr = 0; dr < 4; dr++) {
                 for (int dc = 0; dc < 8; dc++) {
                     inv.setItem((dr + BOARD_ROW_OFFSET) * 9 + dc, toItemFor(board.getPiece(boardRow(viewer, dr), boardCol(viewer, dc))));
@@ -613,10 +652,37 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             inv.setItem(SLOT_WHITE_CLOCK, clockItem(true));
             inv.setItem(SLOT_BLACK_CLOCK, clockItem(false));
             inv.setItem(SLOT_FLIP, createButton("ARROW", ChatColor.GREEN + "Flip", "Turn the board around"));
-            inv.setItem(SLOT_RESIGN, createButton("BARRIER", ChatColor.RED + "Resign", "Give up the game"));
+            if (running) {
+                inv.setItem(SLOT_RESIGN, createButton("BARRIER", ChatColor.RED + "Resign", "Give up the game"));
+            } else {
+                inv.setItem(SLOT_RESIGN, createButton("PAPER", ChatColor.GOLD + "Game over", result.isEmpty() ? "Finished" : result));
+            }
             inv.setItem(SLOT_TIME, createButton("CLOCK", ChatColor.GOLD + "Time",
                     "White: " + formatTime(whiteTime), "Black: " + formatTime(blackTime), "Click to post in chat"));
             inv.setItem(SLOT_CLOSE, createButton("OAK_SIGN", ChatColor.GRAY + "Close", "Hide the board (/chess reopens it)"));
+        }
+
+        /** Rows 0..1 of the chest (above the board) show the promotion choices while one is pending. */
+        private void fillPromotion(Inventory inv, UUID viewer) {
+            for (int i = 0; i < 8; i++) {
+                inv.setItem(i, null);
+                inv.setItem(9 + i, null);
+            }
+            if (!running || pendingMove == null) return;
+            if (viewer.equals(pendingPlayer)) {
+                for (int i = 0; i < PROMO_TYPES.length; i++) {
+                    ItemStack it = plugin.pieceItem(pendingMove.promotionColor, PROMO_TYPES[i]);
+                    ItemMeta m = it.getItemMeta();
+                    if (m != null) {
+                        m.setDisplayName(ChatColor.GREEN + "Promote to " + PROMO_TYPES[i].name());
+                        m.setLore(Collections.singletonList("Click to choose"));
+                        it.setItemMeta(m);
+                    }
+                    inv.setItem(SLOT_PROMO_FIRST + i, it);
+                }
+            } else {
+                inv.setItem(SLOT_PROMO_FIRST + 1, createButton("PAPER", ChatColor.YELLOW + "Opponent is choosing a promotion piece..."));
+            }
         }
 
         /**
@@ -674,7 +740,6 @@ public class ChessPlugin extends JavaPlugin implements Listener {
 
         // Handle clicks in combined view
         void onInventoryClick(Player p, InventoryClickEvent e) {
-            if (!running) return;
             int raw = e.getRawSlot();
             if (raw < 0) return;
             UUID id = p.getUniqueId();
@@ -685,6 +750,8 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                     handleButton(p, raw);
                 } else if (r >= BOARD_ROW_OFFSET) {
                     handleBoardClick(p, boardRow(id, r - BOARD_ROW_OFFSET), boardCol(id, c));
+                } else if (r == 0 && c >= SLOT_PROMO_FIRST && c < SLOT_PROMO_FIRST + PROMO_TYPES.length) {
+                    handlePromotionClick(p, PROMO_TYPES[c - SLOT_PROMO_FIRST]);
                 }
             } else {
                 // player inventory region: rawSlot >= 54 (main rows first, then hotbar)
@@ -705,6 +772,7 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                     refresh(p);
                     break;
                 case SLOT_RESIGN:
+                    if (!running) break;
                     endGame(p.getName() + " resigned. " + (p.getUniqueId().equals(white.getUniqueId()) ? black.getName() : white.getName()) + " wins.");
                     break;
                 case SLOT_WHITE_CLOCK:
@@ -721,7 +789,11 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         }
 
         private void handleBoardClick(Player player, int br, int bc) {
-            if (!running) return;
+            if (!running) return; // game over: the board is view-only
+            if (pendingMove != null) {
+                player.sendMessage(ChatColor.RED + "A promotion piece has to be chosen first.");
+                return;
+            }
             ChessPiece clicked = board.getPiece(br, bc);
             boolean isWhitePlayer = player.getUniqueId().equals(white.getUniqueId());
             if (selectedPlayer == null) {
@@ -769,20 +841,40 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 if (move.isDoublePawn) lastDoublePawn = new int[]{move.toX, move.toY};
                 else lastDoublePawn = null;
                 board.applyMove(move);
-                // promotion to queen if needed
-                if (move.promotion) {
-                    board.setPiece(move.toX, move.toY, new ChessPiece(move.promotionColor, ChessPieceType.QUEEN, move.toX, move.toY));
-                }
-                board.whiteToMove = !board.whiteToMove;
                 selectedPlayer = null; selectedX = -1; selectedY = -1;
-                updateAllInventories();
-                if (board.isInCheckmate(board.whiteToMove)) {
-                    endGame((board.whiteToMove ? "White" : "Black") + " is checkmated. " + (board.whiteToMove ? black.getName() : white.getName()) + " wins.");
+                if (move.promotion) {
+                    // the pawn waits on the last rank until its owner picks the new piece
+                    pendingMove = move;
+                    pendingPlayer = player.getUniqueId();
+                    player.sendMessage(ChatColor.YELLOW + "Pick a piece to promote your pawn to (top of the board).");
+                    updateAllInventories();
                     return;
                 }
-                if (board.isStalemate(board.whiteToMove)) {
-                    endGame("Draw by stalemate.");
-                }
+                completeMove();
+            }
+        }
+
+        private void handlePromotionClick(Player p, ChessPieceType type) {
+            if (!running || pendingMove == null || !p.getUniqueId().equals(pendingPlayer)) return;
+            ChessMove m = pendingMove;
+            ChessPiece promoted = new ChessPiece(m.promotionColor, type, m.toX, m.toY);
+            promoted.hasMoved = true; // a promoted rook must never count as an unmoved castling rook
+            board.setPiece(m.toX, m.toY, promoted);
+            pendingMove = null;
+            pendingPlayer = null;
+            completeMove();
+        }
+
+        /** Hand the turn over, redraw, and check for the end of the game. */
+        private void completeMove() {
+            board.whiteToMove = !board.whiteToMove;
+            updateAllInventories();
+            if (board.isInCheckmate(board.whiteToMove)) {
+                endGame((board.whiteToMove ? "White" : "Black") + " is checkmated. " + (board.whiteToMove ? black.getName() : white.getName()) + " wins.");
+                return;
+            }
+            if (board.isStalemate(board.whiteToMove)) {
+                endGame("Draw by stalemate.");
             }
         }
 
