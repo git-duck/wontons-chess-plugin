@@ -468,6 +468,9 @@ public class ChessPlugin extends JavaPlugin implements Listener {
         static final int SLOT_RESIGN = 35;
         static final int SLOT_TIME = 44;
         static final int SLOT_CLOSE = 53;
+        // The chest has 6 rows but the board only needs 4. Start it 2 rows down so the top half
+        // sits directly above the player's inventory half, with no gap between the two.
+        static final int BOARD_ROW_OFFSET = 2;
 
         final ChessPlugin plugin;
         final Player white;
@@ -600,11 +603,11 @@ public class ChessPlugin extends JavaPlugin implements Listener {
             p.updateInventory();
         }
 
-        /** Top chest: display rows 0..3 of the board, plus the button column on the right. */
+        /** Top chest: display rows 0..3 of the board (chest rows 2..5), plus the button column on the right. */
         private void fillTop(Inventory inv, UUID viewer) {
             for (int dr = 0; dr < 4; dr++) {
                 for (int dc = 0; dc < 8; dc++) {
-                    inv.setItem(dr * 9 + dc, toItemFor(board.getPiece(boardRow(viewer, dr), boardCol(viewer, dc))));
+                    inv.setItem((dr + BOARD_ROW_OFFSET) * 9 + dc, toItemFor(board.getPiece(boardRow(viewer, dr), boardCol(viewer, dc))));
                 }
             }
             inv.setItem(SLOT_WHITE_CLOCK, clockItem(true));
@@ -680,8 +683,8 @@ public class ChessPlugin extends JavaPlugin implements Listener {
                 int c = raw % 9;
                 if (c == 8) {
                     handleButton(p, raw);
-                } else if (r < 4) {
-                    handleBoardClick(p, boardRow(id, r), boardCol(id, c));
+                } else if (r >= BOARD_ROW_OFFSET) {
+                    handleBoardClick(p, boardRow(id, r - BOARD_ROW_OFFSET), boardCol(id, c));
                 }
             } else {
                 // player inventory region: rawSlot >= 54 (main rows first, then hotbar)
